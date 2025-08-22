@@ -1,7 +1,7 @@
 Flask==2.3.2
 telethon==1.36.0
 python-telegram-bot==21.4
-pandas==2.2.2
+pandas==2.2.3  # Updated to fix Python 3.13 compatibility
 requests==2.32.3
 python-dotenv==1.0.1
 
