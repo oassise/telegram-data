@@ -9,7 +9,7 @@ from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
 from telegram import Bot, Update
-from telegram.ext import Application, Dispatcher
+from telegram.ext import Application
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -39,17 +39,15 @@ RENDER_URL = "https://telegram-data.onrender.com"
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
 bots = [Bot(token=token) for token in BOT_TOKENS]
-dispatchers = [Application.builder().token(token).build() for token in BOT_TOKENS]
+applications = [Application.builder().token(token).build() for token in BOT_TOKENS]
 daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in BOT_TOKENS}
 
 # GitHub API functions
 def upload_to_github(content, file_path):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    # Get current file SHA
     response = requests.get(url, headers=headers)
     sha = response.json().get("sha") if response.status_code == 200 else None
-    # Encode content
     encoded_content = base64.b64encode(content).decode("utf-8")
     data = {
         "message": f"Update {file_path}",
@@ -168,9 +166,9 @@ async def add_members(target_group, progress_callback):
 @app.route("/telegram/<token>", methods=["POST"])
 async def telegram_webhook(token):
     if token in BOT_TOKENS:
-        dispatcher = dispatchers[BOT_TOKENS.index(token)]
+        application = applications[BOT_TOKENS.index(token)]
         update = Update.de_json(request.get_json(), bots[BOT_TOKENS.index(token)])
-        await dispatcher.process_update(update)
+        await application.process_update(update)
     return jsonify({"status": "ok"})
 
 # Health check
