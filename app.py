@@ -44,39 +44,47 @@ daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in B
 
 # GitHub API functions
 def upload_to_github(content, file_path):
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    response = requests.get(url, headers=headers)
-    sha = response.json().get("sha") if response.status_code == 200 else None
-    encoded_content = base64.b64encode(content).decode("utf-8")
-    data = {
-        "message": f"Update {file_path}",
-        "content": encoded_content,
-        "sha": sha
-    } if sha else {
-        "message": f"Create {file_path}",
-        "content": encoded_content
-    }
-    logger.info(f"Uploading to GitHub: {file_path}, content length: {len(encoded_content)}")
-    response = requests.put(url, headers=headers, json=data)
-    if response.status_code not in (200, 201):
-        logger.error(f"GitHub upload failed: {response.status_code}, {response.json()}")
-        raise Exception(f"GitHub upload failed: {response.json().get('message', 'Unknown error')}")
-    logger.info(f"Successfully uploaded {file_path} to GitHub")
-    return True
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        response = requests.get(url, headers=headers)
+        sha = response.json().get("sha") if response.status_code == 200 else None
+        encoded_content = base64.b64encode(content).decode("utf-8")
+        data = {
+            "message": f"Update {file_path}",
+            "content": encoded_content,
+            "sha": sha
+        } if sha else {
+            "message": f"Create {file_path}",
+            "content": encoded_content
+        }
+        logger.info(f"Uploading to GitHub: {file_path}, content length: {len(encoded_content)}")
+        response = requests.put(url, headers=headers, json=data)
+        if response.status_code not in (200, 201):
+            logger.error(f"GitHub upload failed: {response.status_code}, {response.json()}")
+            raise Exception(f"GitHub upload failed: {response.json().get('message', 'Unknown error')}")
+        logger.info(f"Successfully uploaded {file_path} to GitHub")
+        return True
+    except Exception as e:
+        logger.error(f"Error in upload_to_github: {str(e)}")
+        raise e
 
 def download_from_github(file_path, local_path):
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        content = base64.b64decode(response.json()["content"])
-        with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
-            f.write(content)
-        logger.info(f"Downloaded {file_path} to {local_path}")
-        return True
-    logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
-    return False
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            content = base64.b64decode(response.json()["content"])
+            with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
+                f.write(content)
+            logger.info(f"Downloaded {file_path} to {local_path}")
+            return True
+        logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in download_from_github: {str(e)}")
+        return False
 
 # Download session file before starting client
 def ensure_session():
@@ -92,6 +100,7 @@ async def scrape_members(source_group, progress_callback):
         try:
             await client.start(phone=lambda: PHONE, password=lambda: os.getenv("TELEGRAM_PASSWORD"))
         except Exception as e:
+            logger.error(f"Error starting TelegramClient: {str(e)}")
             if os.path.exists(f"{SESSION_NAME}.session"):
                 with open(f"{SESSION_NAME}.session", "rb") as f:
                     upload_to_github(f.read(), GITHUB_SESSION_PATH)
@@ -121,6 +130,10 @@ async def scrape_members(source_group, progress_callback):
             for m in members:
                 csv_content += f"{m['user_id']},{m['username']},{m['first_name']},{m['last_name']}\n"
             logger.info(f"CSV content length: {len(csv_content)}")
+            # Save debug CSV locally for verification
+            with open("debug.csv", "w") as f:
+                f.write(csv_content)
+            logger.info("Saved debug.csv locally")
             # Upload to GitHub
             if not upload_to_github(csv_content.encode("utf-8"), GITHUB_FILE_PATH):
                 raise Exception("Failed to upload members.csv to GitHub")
@@ -137,39 +150,47 @@ async def scrape_members(source_group, progress_callback):
 async def add_members(target_group, progress_callback):
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
         return 0, "No members found in GitHub. Please scrape members first."
-    df = pd.read_csv("members.csv")
-    added_count = 0
-    total = len(df)
-    logger.info(f"Adding {total} members to {target_group}")
-    for i, bot in enumerate(bots):
-        token = BOT_TOKENS[i]
-        if daily_limits[token]["reset_date"] < datetime.now():
-            daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
-        bot_limit = daily_limits[token]["count"]
-        if bot_limit >= DAILY_LIMIT_PER_BOT:
-            continue
-        for j, row in df.iterrows():
+    try:
+        df = pd.read_csv("members.csv")
+        added_count = 0
+        total = len(df)
+        logger.info(f"Adding {total} members to {target_group}")
+        for i, bot in enumerate(bots):
+            token = BOT_TOKENS[i]
+            if daily_limits[token]["reset_date"] < datetime.now():
+                daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
+            bot_limit = daily_limits[token]["count"]
             if bot_limit >= DAILY_LIMIT_PER_BOT:
-                break
-            try:
-                await bot.invite_to_chat(chat_id=target_group, user_id=row["user_id"])
-                added_count += 1
-                bot_limit += 1
-                daily_limits[token]["count"] = bot_limit
-                progress_callback((added_count) / total * 100)
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Error adding user {row['user_id']}: {str(e)}")
-    return added_count, f"Added {added_count} members"
+                continue
+            for j, row in df.iterrows():
+                if bot_limit >= DAILY_LIMIT_PER_BOT:
+                    break
+                try:
+                    await bot.invite_to_chat(chat_id=target_group, user_id=row["user_id"])
+                    added_count += 1
+                    bot_limit += 1
+                    daily_limits[token]["count"] = bot_limit
+                    progress_callback((added_count) / total * 100)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error adding user {row['user_id']}: {str(e)}")
+        return added_count, f"Added {added_count} members"
+    except Exception as e:
+        logger.error(f"Error in add_members: {str(e)}")
+        return 0, f"Error adding members: {str(e)}"
 
 # Webhook handler
 @app.route("/telegram/<token>", methods=["POST"])
 async def telegram_webhook(token):
-    if token in BOT_TOKENS:
-        application = applications[BOT_TOKENS.index(token)]
-        update = Update.de_json(request.get_json(), bots[BOT_TOKENS.index(token)])
-        await application.process_update(update)
-    return jsonify({"status": "ok"})
+    try:
+        if token in BOT_TOKENS:
+            application = applications[BOT_TOKENS.index(token)]
+            update = Update.de_json(request.get_json(), bots[BOT_TOKENS.index(token)])
+            await application.process_update(update)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # Health check
 @app.route("/healthcheck", methods=["GET"])
@@ -206,6 +227,7 @@ async def scrape():
     source_group = data.get("sourceGroup")
     user_id = data.get("userId")
     if not source_group or not user_id:
+        logger.error("Missing source group URL or user ID")
         return jsonify({"message": "Missing source group URL or user ID"}), 400
     def progress_callback(progress):
         global scrape_progress
@@ -225,6 +247,7 @@ async def add():
     target_group = data.get("targetGroup")
     user_id = data.get("userId")
     if not target_group or not user_id:
+        logger.error("Missing target group URL or user ID")
         return jsonify({"message": "Missing target group URL or user ID"}), 400
     def progress_callback(progress):
         global add_progress
@@ -240,6 +263,7 @@ async def add():
 @app.route("/api/members")
 def get_members():
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+        logger.error("Failed to download members.csv")
         return jsonify([])
     try:
         df = pd.read_csv("members.csv")
