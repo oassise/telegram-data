@@ -43,12 +43,22 @@ applications = []
 for token in BOT_TOKENS:
     try:
         bot = Bot(token=token)
+        application = Application.builder().token(token).build()
         bots.append(bot)
-        applications.append(Application.builder().token(token).build())
+        applications.append(application)
         logger.info(f"Initialized bot with token {token[:10]}...")
     except Exception as e:
         logger.error(f"Failed to initialize bot with token {token[:10]}...: {str(e)}")
 daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in BOT_TOKENS}
+
+# Initialize applications
+async def initialize_applications():
+    for application in applications:
+        try:
+            await application.initialize()
+            logger.info("Application initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize application: {str(e)}")
 
 # GitHub API functions
 def upload_to_github(content, file_path):
@@ -311,5 +321,6 @@ async def setup_webhooks():
             logger.error(f"Failed to set webhook for bot {i+1}: {str(e)}")
 
 if __name__ == "__main__":
+    asyncio.run(initialize_applications())
     asyncio.run(setup_webhooks())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
