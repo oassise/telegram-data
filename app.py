@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
 import logging
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -87,22 +88,32 @@ def upload_to_github(content, file_path):
         logger.error(f"Error in upload_to_github: {str(e)}")
         raise e
 
-def download_from_github(file_path, local_path):
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            content = base64.b64decode(response.json()["content"])
-            with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
-                f.write(content)
-            logger.info(f"Downloaded {file_path} to {local_path}")
-            return True
-        logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
-        return False
-    except Exception as e:
-        logger.error(f"Error in download_from_github: {str(e)}")
-        return False
+def download_from_github(file_path, local_path, retries=3, delay=5):
+    for attempt in range(1, retries + 1):
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+            logger.info(f"Attempt {attempt}: Downloading {file_path} from GitHub")
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                content = base64.b64decode(response.json()["content"])
+                with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
+                    f.write(content)
+                logger.info(f"Downloaded {file_path} to {local_path}, size: {len(content)} bytes")
+                return True
+            else:
+                logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
+                if response.status_code == 403 and "rate limit" in response.text.lower():
+                    logger.warning(f"GitHub rate limit exceeded, retrying after {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    return False
+        except Exception as e:
+            logger.error(f"Error in download_from_github (attempt {attempt}): {str(e)}")
+            if attempt == retries:
+                return False
+            time.sleep(delay)
+    return False
 
 # Download session file before starting client
 def ensure_session():
@@ -167,9 +178,18 @@ async def scrape_members(source_group, progress_callback):
 # Add members
 async def add_members(target_group, progress_callback):
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+        logger.error("Failed to download members.csv from GitHub")
         return 0, "No members found in GitHub. Please scrape members first."
     try:
+        if not os.path.exists("members.csv"):
+            logger.error("members.csv not found locally after download attempt")
+            return 0, "No members found in GitHub. Please scrape members first."
+        with open("members.csv", "r") as f:
+            logger.info(f"members.csv content preview: {f.read(100)}...")
         df = pd.read_csv("members.csv")
+        if df.empty:
+            logger.error("members.csv is empty")
+            return 0, "No members found in GitHub. Please scrape members first."
         added_count = 0
         total = len(df)
         logger.info(f"Adding {total} members to {target_group}")
