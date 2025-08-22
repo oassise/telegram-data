@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Group Manager</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; }
+        button { padding: 10px; margin: 5px; background-color: #0088cc; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #005f8a; }
+        .progress-container { margin: 10px 0; }
+        .progress-bar { width: 100%; height: 20px; background-color: #f0f0f0; }
+        .progress-fill { height: 100%; background-color: #0088cc; width: 0%; transition: width 0.5s; }
+        #memberList { max-height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Telegram Group Manager</h1>
+    <input id="sourceGroup" type="text" placeholder="Source Group URL (e.g., https://t.me/sourcegroup)">
+    <button onclick="scrapeMembers()">Scrape Members</button>
+    <div class="progress-container">
+        <p>Scraping Progress: <span id="scrapeStatus">0%</span></p>
+        <div class="progress-bar"><div id="scrapeProgress" class="progress-fill"></div></div>
+    </div>
+    <input id="targetGroup" type="text" placeholder="Target Group URL (e.g., https://t.me/targetgroup)">
+    <button onclick="addMembers()">Add Members</button>
+    <div class="progress-container">
+        <p>Adding Progress: <span id="addStatus">0%</span></p>
+        <div class="progress-bar"><div id="addProgress" class="progress-fill"></div></div>
+    </div>
+    <h3>Scraped Members</h3>
+    <div id="memberList"></div>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+
+        async function scrapeMembers() {
+            const sourceGroup = document.getElementById("sourceGroup").value;
+            if (!sourceGroup) {
+                tg.showAlert("Please enter a source group URL.");
+                return;
+            }
+            document.getElementById("scrapeStatus").textContent = "0%";
+            document.getElementById("scrapeProgress").style.width = "0%";
+            try {
+                const response = await fetch("/api/scrape", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ userId: tg.initDataUnsafe.user.id, sourceGroup })
+                });
+                const data = await response.json();
+                tg.showAlert(data.message);
+                updateMemberList();
+            } catch (error) {
+                tg.showAlert("Error: " + error.message);
+            }
+        }
+
+        async function addMembers() {
+            const targetGroup = document.getElementById("targetGroup").value;
+            if (!targetGroup) {
+                tg.showAlert("Please enter a target group URL.");
+                return;
+            }
+            document.getElementById("addStatus").textContent = "0%";
+            document.getElementById("addProgress").style.width = "0%";
+            try {
+                const response = await fetch("/api/add", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ userId: tg.initDataUnsafe.user.id, targetGroup })
+                });
+                const data = await response.json();
+                tg.showAlert(data.message);
+            } catch (error) {
+                tg.showAlert("Error: " + error.message);
+            }
+        }
+
+        function updateProgress(eventSource, type) {
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                const progressElement = document.getElementById(`${type}Progress`);
+                const statusElement = document.getElementById(`${type}Status`);
+                progressElement.style.width = `${data.progress}%`;
+                statusElement.textContent = `${data.progress}%`;
+                if (data.progress === 100) eventSource.close();
+            };
+        }
+
+        async function updateMemberList() {
+            try {
+                const response = await fetch("/api/members");
+                const members = await response.json();
+                const memberList = document.getElementById("memberList");
+                memberList.innerHTML = members.map(m => `<p>${m.username || m.user_id}: ${m.first_name} ${m.last_name}</p>`).join("");
+            } catch (error) {
+                console.error("Error fetching members:", error);
+            }
+        }
+
+        // Initialize progress updates
+        const scrapeSource = new EventSource("/api/scrape-progress");
+        updateProgress(scrapeSource, "scrape");
+        const addSource = new EventSource("/api/add-progress");
+        updateProgress(addSource, "add");
+        updateMemberList();
+    </script>
+</body>
+</html>
