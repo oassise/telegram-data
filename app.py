@@ -3,7 +3,7 @@ import csv
 import time
 import base64
 import requests
-from flask import Flask, request, jsonify, render_template, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import GetParticipantsRequest
@@ -14,7 +14,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
-import logging  # Added for debugging
+import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -67,7 +67,6 @@ def upload_to_github(content, file_path):
     logger.info(f"Successfully uploaded {file_path} to GitHub")
     return True
 
-
 def download_from_github(file_path, local_path):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
@@ -93,7 +92,7 @@ async def scrape_members(source_group, progress_callback):
         raise Exception("Failed to download session file")
     async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
         try:
-            await client.start(phone=lambda: PHONE)
+            await client.start(phone=lambda: PHONE, password=lambda: os.getenv("TELEGRAM_PASSWORD"))
         except Exception as e:
             if os.path.exists(f"{SESSION_NAME}.session"):
                 with open(f"{SESSION_NAME}.session", "rb") as f:
@@ -143,6 +142,7 @@ async def add_members(target_group, progress_callback):
     df = pd.read_csv("members.csv")
     added_count = 0
     total = len(df)
+    logger.info(f"Adding {total} members to {target_group}")
     for i, bot in enumerate(bots):
         token = BOT_TOKENS[i]
         if daily_limits[token]["reset_date"] < datetime.now():
@@ -161,7 +161,7 @@ async def add_members(target_group, progress_callback):
                 progress_callback((added_count) / total * 100)
                 await asyncio.sleep(1)
             except Exception as e:
-                print(f"Error adding user {row['user_id']}: {str(e)}")
+                logger.error(f"Error adding user {row['user_id']}: {str(e)}")
     return added_count, f"Added {added_count} members"
 
 # Webhook handler
@@ -199,7 +199,7 @@ def add_progress_stream():
 # Routes
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return jsonify({"message": "Please access the Mini App via Telegram"})
 
 @app.route("/api/scrape", methods=["POST"])
 async def scrape():
@@ -236,20 +236,28 @@ async def add():
         add_progress = 100
         return jsonify({"message": message})
     except Exception as e:
+        logger.error(f"Add error: {str(e)}")
         return jsonify({"message": f"Error adding members: {str(e)}"}), 500
 
 @app.route("/api/members")
 def get_members():
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
         return jsonify([])
-    df = pd.read_csv("members.csv")
-    return jsonify(df.to_dict(orient="records"))
+    try:
+        df = pd.read_csv("members.csv")
+        return jsonify(df.to_dict(orient="records"))
+    except Exception as e:
+        logger.error(f"Error reading members.csv: {str(e)}")
+        return jsonify([])
 
 async def setup_webhooks():
     for i, bot in enumerate(bots):
-        await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
+        try:
+            await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
+            logger.info(f"Webhook set for bot {i+1}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook for bot {i+1}: {str(e)}")
 
 if __name__ == "__main__":
     asyncio.run(setup_webhooks())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
