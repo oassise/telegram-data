@@ -14,6 +14,11 @@ import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
+import logging  # Added for debugging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -41,8 +46,10 @@ daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in B
 def upload_to_github(content, file_path):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    # Get current file SHA
     response = requests.get(url, headers=headers)
     sha = response.json().get("sha") if response.status_code == 200 else None
+    # Encode content
     encoded_content = base64.b64encode(content).decode("utf-8")
     data = {
         "message": f"Update {file_path}",
@@ -52,8 +59,14 @@ def upload_to_github(content, file_path):
         "message": f"Create {file_path}",
         "content": encoded_content
     }
+    logger.info(f"Uploading to GitHub: {file_path}, content length: {len(encoded_content)}")
     response = requests.put(url, headers=headers, json=data)
-    return response.status_code == 200 or response.status_code == 201
+    if response.status_code not in (200, 201):
+        logger.error(f"GitHub upload failed: {response.status_code}, {response.json()}")
+        raise Exception(f"GitHub upload failed: {response.json().get('message', 'Unknown error')}")
+    logger.info(f"Successfully uploaded {file_path} to GitHub")
+    return True
+
 
 def download_from_github(file_path, local_path):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
@@ -63,7 +76,9 @@ def download_from_github(file_path, local_path):
         content = base64.b64decode(response.json()["content"])
         with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
             f.write(content)
+        logger.info(f"Downloaded {file_path} to {local_path}")
         return True
+    logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
     return False
 
 # Download session file before starting client
@@ -80,31 +95,46 @@ async def scrape_members(source_group, progress_callback):
         try:
             await client.start(phone=lambda: PHONE)
         except Exception as e:
-            # If authentication fails, save session and upload
             if os.path.exists(f"{SESSION_NAME}.session"):
                 with open(f"{SESSION_NAME}.session", "rb") as f:
                     upload_to_github(f.read(), GITHUB_SESSION_PATH)
             raise e
-        group = await client.get_entity(source_group)
-        participants = await client(GetParticipantsRequest(
-            channel=group, filter=ChannelParticipantsSearch(""), offset=0, limit=1000, hash=0
-        ))
-        members = []
-        total = len(participants.users)
-        for i, user in enumerate(participants.users):
-            username = user.username if user.username else ""
-            members.append({"user_id": user.id, "username": username, "first_name": user.first_name or "", "last_name": user.last_name or ""})
-            progress_callback((i + 1) / total * 100)
-            await asyncio.sleep(0.5)
-        csv_content = "user_id,username,first_name,last_name\n" + "\n".join(
-            f"{m['user_id']},{m['username']},{m['first_name']},{m['last_name']}" for m in members
-        )
-        upload_to_github(csv_content.encode("utf-8"), GITHUB_FILE_PATH)
-        # Save and upload session file
-        if os.path.exists(f"{SESSION_NAME}.session"):
-            with open(f"{SESSION_NAME}.session", "rb") as f:
-                upload_to_github(f.read(), GITHUB_SESSION_PATH)
-        return members
+        try:
+            group = await client.get_entity(source_group)
+            participants = await client(GetParticipantsRequest(
+                channel=group, filter=ChannelParticipantsSearch(""), offset=0, limit=1000, hash=0
+            ))
+            members = []
+            total = len(participants.users)
+            logger.info(f"Scraped {total} members from {source_group}")
+            if total == 0:
+                raise Exception("No members found in the group")
+            for i, user in enumerate(participants.users):
+                username = user.username if user.username else ""
+                members.append({
+                    "user_id": user.id,
+                    "username": username,
+                    "first_name": user.first_name or "",
+                    "last_name": user.last_name or ""
+                })
+                progress_callback((i + 1) / total * 100)
+                await asyncio.sleep(0.5)
+            # Generate CSV content
+            csv_content = "user_id,username,first_name,last_name\n"
+            for m in members:
+                csv_content += f"{m['user_id']},{m['username']},{m['first_name']},{m['last_name']}\n"
+            logger.info(f"CSV content length: {len(csv_content)}")
+            # Upload to GitHub
+            if not upload_to_github(csv_content.encode("utf-8"), GITHUB_FILE_PATH):
+                raise Exception("Failed to upload members.csv to GitHub")
+            # Save and upload session file
+            if os.path.exists(f"{SESSION_NAME}.session"):
+                with open(f"{SESSION_NAME}.session", "rb") as f:
+                    upload_to_github(f.read(), GITHUB_SESSION_PATH)
+            return members
+        except Exception as e:
+            logger.error(f"Error in scrape_members: {str(e)}")
+            raise e
 
 # Add members
 async def add_members(target_group, progress_callback):
@@ -187,6 +217,7 @@ async def scrape():
         scrape_progress = 100
         return jsonify({"message": f"Scraped {len(members)} members and saved to GitHub"})
     except Exception as e:
+        logger.error(f"Scrape error: {str(e)}")
         return jsonify({"message": f"Error scraping members: {str(e)}"}), 500
 
 @app.route("/api/add", methods=["POST"])
@@ -221,3 +252,4 @@ async def setup_webhooks():
 if __name__ == "__main__":
     asyncio.run(setup_webhooks())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
