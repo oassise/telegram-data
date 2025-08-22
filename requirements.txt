@@ -1,8 +1,10 @@
 Flask==2.3.2
 telethon==1.36.0
 python-telegram-bot==21.4
-pandas==2.2.3  # Updated to fix Python 3.13 compatibility
+pandas==2.2.3
 requests==2.32.3
 python-dotenv==1.0.1
 cython==3.0.10
-flask-cors==4.0.1  # Add this line
+flask-cors==4.0.1
+asgiref==3.8.1
+uvicorn==0.32.0

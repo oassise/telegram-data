@@ -27,7 +27,7 @@ load_dotenv()
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
-BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2)]
+BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2) if os.getenv(f"BOT_TOKEN_{i+1}")]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_FILE_PATH = "members.csv"
@@ -38,8 +38,16 @@ RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
-bots = [Bot(token=token) for token in BOT_TOKENS]
-applications = [Application.builder().token(token).build() for token in BOT_TOKENS]
+bots = []
+applications = []
+for token in BOT_TOKENS:
+    try:
+        bot = Bot(token=token)
+        bots.append(bot)
+        applications.append(Application.builder().token(token).build())
+        logger.info(f"Initialized bot with token {token[:10]}...")
+    except Exception as e:
+        logger.error(f"Failed to initialize bot with token {token[:10]}...: {str(e)}")
 daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in BOT_TOKENS}
 
 # GitHub API functions
@@ -183,13 +191,20 @@ async def add_members(target_group, progress_callback):
 @app.route("/telegram/<token>", methods=["POST"])
 async def telegram_webhook(token):
     try:
-        if token in BOT_TOKENS:
-            application = applications[BOT_TOKENS.index(token)]
-            update = Update.de_json(request.get_json(), bots[BOT_TOKENS.index(token)])
+        if token not in BOT_TOKENS:
+            logger.error(f"Invalid bot token: {token[:10]}...")
+            return jsonify({"status": "error", "message": "Invalid bot token"}), 401
+        data = request.get_json(silent=True)
+        if not data:
+            logger.error("Invalid JSON payload in webhook")
+            return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
+        application = applications[BOT_TOKENS.index(token)]
+        update = Update.de_json(data, bots[BOT_TOKENS.index(token)])
+        if update:
             await application.process_update(update)
         return jsonify({"status": "ok"})
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
+        logger.error(f"Webhook error for token {token[:10]}...: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # Health check
@@ -223,7 +238,10 @@ def index():
 @app.route("/api/scrape", methods=["POST"])
 async def scrape():
     global scrape_progress
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not data:
+        logger.error("Invalid JSON payload in /api/scrape")
+        return jsonify({"message": "Invalid JSON payload"}), 400
     source_group = data.get("sourceGroup")
     user_id = data.get("userId")
     if not source_group or not user_id:
@@ -243,7 +261,10 @@ async def scrape():
 @app.route("/api/add", methods=["POST"])
 async def add():
     global add_progress
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not data:
+        logger.error("Invalid JSON payload in /api/add")
+        return jsonify({"message": "Invalid JSON payload"}), 400
     target_group = data.get("targetGroup")
     user_id = data.get("userId")
     if not target_group or not user_id:
@@ -271,6 +292,15 @@ def get_members():
     except Exception as e:
         logger.error(f"Error reading members.csv: {str(e)}")
         return jsonify([])
+
+@app.route("/api/debug-csv")
+def get_debug_csv():
+    try:
+        with open("debug.csv", "r") as f:
+            return Response(f.read(), mimetype="text/csv")
+    except Exception as e:
+        logger.error(f"Error reading debug.csv: {str(e)}")
+        return jsonify({"message": "Debug CSV not found"}), 404
 
 async def setup_webhooks():
     for i, bot in enumerate(bots):
