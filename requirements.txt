@@ -4,4 +4,5 @@ python-telegram-bot==21.4
 pandas==2.2.3  # Updated to fix Python 3.13 compatibility
 requests==2.32.3
 python-dotenv==1.0.1
-
+cython==3.0.10
+flask-cors==4.0.1  # Add this line

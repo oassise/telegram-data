@@ -2,6 +2,7 @@ import os
 import csv
 import time
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
+from flask_cors import CORS  # Import CORS
 from telethon.sync import TelegramClient
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
@@ -18,17 +19,20 @@ load_dotenv()
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
-BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2)]  # Add more tokens as needed
+BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2)]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g., "username/telegram-data"
+GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_FILE_PATH = "members.csv"
 SESSION_NAME = "session"
 DAILY_LIMIT_PER_BOT = 50
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})  # Allow Firebase domain
 bots = [Bot(token=token) for token in BOT_TOKENS]
 daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in BOT_TOKENS}
 
+# Rest of your original app.py code remains unchanged
+# ...
 # GitHub API functions
 def upload_to_github(content):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
