@@ -37,7 +37,7 @@ DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://my-app.web.app"}})
+CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
 bots = []
 applications = []
 for token in BOT_TOKENS:
@@ -106,8 +106,11 @@ def download_from_github(file_path, local_path, retries=5, delay=10):
                 if not content:
                     logger.error("Downloaded content is empty")
                     return False
-                with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
-                    f.write(content)
+                # Decode bytes to string for text files
+                write_content = content.decode("utf-8") if not file_path.endswith(".session") else content
+                logger.info(f"Content type: {'text' if not file_path.endswith('.session') else 'binary'}, length: {len(content)} bytes")
+                with open(local_path, "w" if not file_path.endswith(".session") else "wb") as f:
+                    f.write(write_content)
                 logger.info(f"Downloaded {file_path} to {local_path}, size: {len(content)} bytes")
                 # Verify file exists and is readable
                 if not os.path.exists(local_path):
@@ -129,8 +132,10 @@ def download_from_github(file_path, local_path, retries=5, delay=10):
                 logger.info(f"Raw URL response status: {raw_response.status_code}, headers: {raw_response.headers}")
                 if raw_response.status_code == 200:
                     content = raw_response.content
-                    with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
-                        f.write(content)
+                    write_content = content.decode("utf-8") if not file_path.endswith(".session") else content
+                    logger.info(f"Raw content type: {'text' if not file_path.endswith('.session') else 'binary'}, length: {len(content)} bytes")
+                    with open(local_path, "w" if not file_path.endswith(".session") else "wb") as f:
+                        f.write(write_content)
                     logger.info(f"Downloaded {file_path} to {local_path} via raw URL, size: {len(content)} bytes")
                     if not os.path.exists(local_path):
                         logger.error(f"File {local_path} not found after writing via raw URL")
