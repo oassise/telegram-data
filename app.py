@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
 import logging
+import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +41,6 @@ GITHUB_SESSION_PATH = "session.session"
 SESSION_NAME = "session"
 DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
-OASSISJOB_CHAT_ID = "-1002077471332"  # Numeric ID for
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
@@ -160,4 +160,350 @@ def download_from_github(file_path, local_path, retries=5, delay=10):
 # Download session file before starting client
 def ensure_session():
     if not os.path.exists(f"{SESSION_NAME}.session"):
-        return download_from_github(GITHUB_SESSION_PATH, f
+        return download_from_github(GITHUB_SESSION_PATH, f"{SESSION_NAME}.session")
+    return True
+
+# Scrape members
+async def scrape_members(source_group, progress_callback):
+    if not ensure_session():
+        raise Exception("Failed to download session file")
+    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
+        try:
+            await client.start(phone=lambda: PHONE, password=lambda: os.getenv("TELEGRAM_PASSWORD"))
+        except Exception as e:
+            logger.error(f"Error starting TelegramClient: {str(e)}")
+            if os.path.exists(f"{SESSION_NAME}.session"):
+                with open(f"{SESSION_NAME}.session", "rb") as f:
+                    upload_to_github(f.read(), GITHUB_SESSION_PATH)
+            raise e
+        try:
+            group = await client.get_entity(source_group)
+            participants = await client(GetParticipantsRequest(
+                channel=group, filter=ChannelParticipantsSearch(""), offset=0, limit=1000, hash=0
+            ))
+            members = []
+            total = len(participants.users)
+            logger.info(f"Scraped {total} members from {source_group}")
+            if total == 0:
+                raise Exception("No members found in the group")
+            for i, user in enumerate(participants.users):
+                username = user.username if user.username else ""
+                members.append({
+                    "user_id": user.id,
+                    "username": username,
+                    "first_name": user.first_name or "",
+                    "last_name": user.last_name or ""
+                })
+                progress_callback((i + 1) / total * 100)
+                await asyncio.sleep(0.5)
+            # Generate CSV content
+            csv_content = "user_id,username,first_name,last_name\n"
+            for m in members:
+                csv_content += f"{m['user_id']},{m['username']},{m['first_name']},{m['last_name']}\n"
+            logger.info(f"CSV content length: {len(csv_content)}")
+            # Save debug CSV locally for verification
+            with open("debug.csv", "w") as f:
+                f.write(csv_content)
+            logger.info("Saved debug.csv locally")
+            # Upload to GitHub
+            if not upload_to_github(csv_content.encode("utf-8"), GITHUB_FILE_PATH):
+                raise Exception("Failed to upload members.csv to GitHub")
+            # Save and upload session file
+            if os.path.exists(f"{SESSION_NAME}.session"):
+                with open(f"{SESSION_NAME}.session", "rb") as f:
+                    upload_to_github(f.read(), GITHUB_SESSION_PATH)
+            return members
+        except Exception as e:
+            logger.error(f"Error in scrape_members: {str(e)}")
+            raise e
+
+# Add members using raw Telegram API
+async def invite_user_to_chat(token, chat_id, user_id):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        url = f"https://api.telegram.org/bot{token}/inviteChatMember"
+        payload = {
+            "chat_id": chat_id,
+            "user_id": user_id
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        result = response.json()
+        logger.info(f"Invite response for user {user_id} to {chat_id}: {result}")
+        if response.status_code == 200 and result.get("ok"):
+            logger.info(f"Successfully invited user {user_id} to {chat_id}")
+            return True
+        else:
+            error_desc = result.get("description", "Unknown error")
+            logger.error(f"Failed to invite user {user_id} to {chat_id}: {error_desc}")
+            return error_desc
+    except Exception as e:
+        logger.error(f"Error inviting user {user_id} to {chat_id}: {str(e)}")
+        return str(e)
+    finally:
+        loop.close()
+
+# Add members
+async def add_members(target_group, progress_callback):
+    if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+        logger.error("Failed to download members.csv from GitHub")
+        return 0, "No members found in GitHub. Please scrape members first."
+    try:
+        if not os.path.exists("members.csv"):
+            logger.error("members.csv not found locally after download attempt")
+            return 0, "No members found in GitHub. Please scrape members first."
+        with open("members.csv", "r") as f:
+            preview = f.read(100)
+            logger.info(f"members.csv content preview: {preview}...")
+        df = pd.read_csv("members.csv")
+        if df.empty:
+            logger.error("members.csv is empty")
+            return 0, "No members found in GitHub. Please scrape members first."
+        added_count = 0
+        total = len(df)
+        # Process target_group URL
+        chat_id = target_group.replace("https://t.me/", "@")
+        logger.info(f"Using chat_id {chat_id}")
+        # Try to resolve chat_id to numeric ID
+        validated_chat_id = None
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            for i, bot in enumerate(bots):
+                try:
+                    chat = await bot.get_chat(chat_id)
+                    validated_chat_id = chat.id  # Use numeric chat ID
+                    logger.info(f"Resolved chat_id {chat_id} to {validated_chat_id}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}")
+                    # Try numeric ID from invite link
+                    invite_response = requests.post(
+                        f"https://api.telegram.org/bot{BOT_TOKENS[i]}/createChatInviteLink",
+                        json={"chat_id": chat_id},
+                        timeout=10
+                    ).json()
+                    if invite_response.get("ok"):
+                        invite_link = invite_response["result"]["invite_link"]
+                        logger.info(f"Created invite link for {chat_id}: {invite_link}")
+                        # Extract numeric ID (not directly possible from link, fallback to chat_id)
+                        validated_chat_id = chat_id
+                    else:
+                        logger.error(f"Failed to create invite link for {chat_id}: {invite_response.get('description')}")
+                        validated_chat_id = chat_id
+                    break
+        finally:
+            loop.close()
+        if not validated_chat_id:
+            return 0, f"Failed to resolve chat_id for {chat_id}"
+        logger.info(f"Adding {total} members to {validated_chat_id}")
+        for i, token in enumerate(BOT_TOKENS):
+            if daily_limits[token]["reset_date"] < datetime.now():
+                daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
+            bot_limit = daily_limits[token]["count"]
+            if bot_limit >= DAILY_LIMIT_PER_BOT:
+                logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
+                continue
+            for j, row in df.iterrows():
+                if bot_limit >= DAILY_LIMIT_PER_BOT:
+                    logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
+                    break
+                user_id = int(row["user_id"])
+                retries = 3
+                for attempt in range(1, retries + 1):
+                    try:
+                        result = await invite_user_to_chat(token, validated_chat_id, user_id)
+                        if result is True:
+                            added_count += 1
+                            bot_limit += 1
+                            daily_limits[token]["count"] = bot_limit
+                            progress_callback((added_count) / total * 100)
+                            logger.info(f"Added user {user_id} to {validated_chat_id}")
+                            break
+                        else:
+                            error_desc = result
+                            if "chat_admin_required" in error_desc.lower():
+                                return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
+                            if "invalid user_id" in error_desc.lower():
+                                logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
+                                break
+                            if "user_privacy_restricted" in error_desc.lower():
+                                logger.warning(f"User {user_id} has restricted group invites, skipping...")
+                                break
+                            if "not a member" in error_desc.lower():
+                                return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
+                            if "not found" in error_desc.lower():
+                                logger.warning(f"Chat {validated_chat_id} not found, skipping user {user_id}...")
+                                return 0, f"Chat {validated_chat_id} not found"
+                            logger.warning(f"Failed to add user {user_id} on attempt {attempt}: {error_desc}, retrying...")
+                    except Exception as e:
+                        logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
+                        if "too many requests" in str(e).lower():
+                            logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
+                            await asyncio.sleep(15)
+                            continue
+                        if attempt == retries:
+                            logger.warning(f"Failed to add user {user_id} after {retries} attempts, skipping...")
+                    await asyncio.sleep(2)  # Avoid rate limits
+        return added_count, f"Added {added_count} members to {validated_chat_id}"
+    except Exception as e:
+        logger.error(f"Error in add_members: {str(e)}")
+        return 0, f"Error adding members: {str(e)}"
+
+# Webhook handler
+@app.route("/telegram/<token>", methods=["POST"])
+async def telegram_webhook(token):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        if token not in BOT_TOKENS:
+            logger.error(f"Invalid bot token: {token[:10]}...")
+            return jsonify({"status": "error", "message": "Invalid bot token"}), 401
+        data = request.get_json(silent=True)
+        if not data:
+            logger.error("Invalid JSON payload in webhook")
+            return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
+        application = applications[BOT_TOKENS.index(token)]
+        update = Update.de_json(data, bots[BOT_TOKENS.index(token)])
+        if update:
+            await application.process_update(update)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Webhook error for token {token[:10]}...: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        loop.close()
+
+# Health check
+@app.route("/healthcheck", methods=["GET"])
+def health():
+    return "The bot is running fine :)"
+
+# Progress streaming
+scrape_progress = 0
+add_progress = 0
+
+@app.route("/api/scrape-progress")
+def scrape_progress_stream():
+    def generate():
+        global scrape_progress
+        yield f"data: {{\"progress\": {scrape_progress}}}\n\n"
+    return Response(stream_with_context(generate()), content_type="text/event-stream")
+
+@app.route("/api/add-progress")
+def add_progress_stream():
+    def generate():
+        global add_progress
+        yield f"data: {{\"progress\": {add_progress}}}\n\n"
+    return Response(stream_with_context(generate()), content_type="text/event-stream")
+
+# Routes
+@app.route("/")
+def index():
+    return jsonify({"message": "Please access the Mini App via Telegram"})
+
+@app.route("/api/scrape", methods=["POST"])
+async def scrape():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global scrape_progress
+    data = request.get_json(silent=True)
+    if not data:
+        logger.error("Invalid JSON payload in /api/scrape")
+        return jsonify({"message": "Invalid JSON payload"}), 400
+    source_group = data.get("sourceGroup")
+    user_id = data.get("userId")
+    if not source_group or not user_id:
+        logger.error("Missing source group URL or user ID")
+        return jsonify({"message": "Missing source group URL or user ID"}), 400
+    def progress_callback(progress):
+        global scrape_progress
+        scrape_progress = round(progress, 2)
+    try:
+        members = await scrape_members(source_group, progress_callback)
+        scrape_progress = 100
+        return jsonify({"message": f"Scraped {len(members)} members and saved to GitHub"})
+    except Exception as e:
+        logger.error(f"Scrape error: {str(e)}")
+        return jsonify({"message": f"Error scraping members: {str(e)}"}), 500
+    finally:
+        loop.close()
+
+@app.route("/api/add", methods=["POST"])
+async def add():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global add_progress
+    data = request.get_json(silent=True)
+    if not data:
+        logger.error("Invalid JSON payload in /api/add")
+        return jsonify({"message": "Invalid JSON payload"}), 400
+    target_group = data.get("targetGroup")
+    user_id = data.get("userId")
+    if not target_group or not user_id:
+        logger.error("Missing target group URL or user ID")
+        return jsonify({"message": "Missing target group URL or user ID"}), 400
+    def progress_callback(progress):
+        global add_progress
+        add_progress = round(progress, 2)
+    try:
+        count, message = await add_members(target_group, progress_callback)
+        add_progress = 100
+        return jsonify({"message": message})
+    except Exception as e:
+        logger.error(f"Add error: {str(e)}")
+        return jsonify({"message": f"Error adding members: {str(e)}"}), 500
+    finally:
+        loop.close()
+
+@app.route("/api/members")
+def get_members():
+    if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+        logger.error("Failed to download members.csv")
+        return jsonify([])
+    try:
+        df = pd.read_csv("members.csv")
+        return jsonify(df.to_dict(orient="records"))
+    except Exception as e:
+        logger.error(f"Error reading members.csv: {str(e)}")
+        return jsonify([])
+
+@app.route("/api/debug-csv")
+def get_debug_csv():
+    try:
+        with open("debug.csv", "r") as f:
+            return Response(f.read(), mimetype="text/csv")
+    except Exception as e:
+        logger.error(f"Error reading debug.csv: {str(e)}")
+        return jsonify({"message": "Debug CSV not found"}), 404
+
+@app.route("/api/check-members")
+def check_members():
+    try:
+        if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+            logger.error("check-members: Failed to download members.csv")
+            return jsonify({"message": "Failed to download members.csv"}), 500
+        with open("members.csv", "r") as f:
+            content = f.read()
+        df = pd.read_csv("members.csv")
+        return jsonify({"message": "Members found", "rows": len(df), "content_preview": content[:100]})
+    except Exception as e:
+        logger.error(f"Error checking members.csv: {str(e)}")
+        return jsonify({"message": f"Error: {str(e)}"}), 500
+
+async def setup_webhooks():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    for i, bot in enumerate(bots):
+        try:
+            await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
+            logger.info(f"Webhook set for bot {i+1}")
+        except Exception as e:
+            logger.error(f"Failed to set webhook for bot {i+1}: {str(e)}")
+    loop.close()
+
+if __name__ == "__main__":
+    loop = asyncio.run(initialize_applications())
+    asyncio.run(setup_webhooks())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    loop.close()
