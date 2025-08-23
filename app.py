@@ -54,6 +54,7 @@ daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in B
 
 # Initialize applications
 async def initialize_applications():
+    loop = asyncio.get_event_loop()
     for application in applications:
         try:
             await application.initialize()
@@ -229,18 +230,19 @@ async def add_members(target_group, progress_callback):
         total = len(df)
         # Process target_group URL
         chat_id = target_group.replace("https://t.me/", "@")
-        logger.info(f"Validating chat_id {chat_id}")
-        # Verify chat_id
+        logger.info(f"Using chat_id {chat_id}")
+        # Fallback to chat_id without validation if get_chat fails
+        validated_chat_id = chat_id
         for i, bot in enumerate(bots):
             try:
                 chat = await bot.get_chat(chat_id)
-                chat_id = chat.id  # Use numeric chat ID for reliability
-                logger.info(f"Resolved chat_id to {chat_id}")
+                validated_chat_id = chat.id  # Use numeric chat ID
+                logger.info(f"Resolved chat_id to {validated_chat_id}")
                 break
             except Exception as e:
-                logger.error(f"Error validating chat_id {chat_id} with bot {i+1}: {str(e)}")
-                return 0, f"Invalid target group {chat_id}: {str(e)}"
-        logger.info(f"Adding {total} members to {chat_id}")
+                logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}. Proceeding with {chat_id}")
+                break  # Use provided chat_id as fallback
+        logger.info(f"Adding {total} members to {validated_chat_id}")
         for i, bot in enumerate(bots):
             token = BOT_TOKENS[i]
             if daily_limits[token]["reset_date"] < datetime.now():
@@ -253,35 +255,41 @@ async def add_members(target_group, progress_callback):
                 if bot_limit >= DAILY_LIMIT_PER_BOT:
                     logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
                     break
-                try:
-                    await bot.invite_chat_members(chat_id=chat_id, user_ids=[int(row["user_id"])])
-                    added_count += 1
-                    bot_limit += 1
-                    daily_limits[token]["count"] = bot_limit
-                    progress_callback((added_count) / total * 100)
-                    logger.info(f"Added user {row['user_id']} to {chat_id}")
-                    await asyncio.sleep(2)  # Increased to avoid rate limits
-                except BadRequest as e:
-                    logger.error(f"BadRequest adding user {row['user_id']} to {chat_id}: {str(e)}")
-                    if "chat_admin_required" in str(e).lower():
-                        return 0, f"Bot {i+1} is not an admin of {chat_id}"
-                    if "user_id_invalid" in str(e).lower():
-                        logger.warning(f"Invalid user ID {row['user_id']} for {chat_id}, skipping...")
-                        continue
-                    if "user_privacy_restricted" in str(e).lower():
-                        logger.warning(f"User {row['user_id']} has restricted group invites, skipping...")
-                        continue
-                except Forbidden as e:
-                    logger.error(f"Forbidden error adding user {row['user_id']} to {chat_id}: {str(e)}")
-                    if "bot is not a member" in str(e).lower():
-                        return 0, f"Bot {i+1} is not a member of {chat_id}"
-                except Exception as e:
-                    logger.error(f"Error adding user {row['user_id']} to {chat_id}: {str(e)}")
-                    if "too many requests" in str(e).lower():
-                        logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
-                        await asyncio.sleep(15)
-                    continue
-        return added_count, f"Added {added_count} members to {chat_id}"
+                user_id = int(row["user_id"])
+                retries = 3
+                for attempt in range(1, retries + 1):
+                    try:
+                        await bot.invite_chat_members(chat_id=validated_chat_id, user_ids=[user_id])
+                        added_count += 1
+                        bot_limit += 1
+                        daily_limits[token]["count"] = bot_limit
+                        progress_callback((added_count) / total * 100)
+                        logger.info(f"Added user {user_id} to {validated_chat_id}")
+                        break
+                    except BadRequest as e:
+                        logger.error(f"BadRequest adding user {user_id} to {validated_chat_id}: {str(e)}")
+                        if "chat_admin_required" in str(e).lower():
+                            return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
+                        if "user_id_invalid" in str(e).lower():
+                            logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
+                            break
+                        if "user_privacy_restricted" in str(e).lower():
+                            logger.warning(f"User {user_id} has restricted group invites, skipping...")
+                            break
+                    except Forbidden as e:
+                        logger.error(f"Forbidden error adding user {user_id} to {validated_chat_id}: {str(e)}")
+                        if "bot is not a member" in str(e).lower():
+                            return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
+                    except Exception as e:
+                        logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
+                        if "too many requests" in str(e).lower():
+                            logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
+                            await asyncio.sleep(15)
+                            continue
+                        if attempt == retries:
+                            logger.warning(f"Failed to add user {user_id} after {retries} attempts, skipping...")
+                    await asyncio.sleep(2)  # Avoid rate limits
+        return added_count, f"Added {added_count} members to {validated_chat_id}"
     except Exception as e:
         logger.error(f"Error in add_members: {str(e)}")
         return 0, f"Error adding members: {str(e)}"
@@ -289,6 +297,7 @@ async def add_members(target_group, progress_callback):
 # Webhook handler
 @app.route("/telegram/<token>", methods=["POST"])
 async def telegram_webhook(token):
+    loop = asyncio.get_event_loop()
     try:
         if token not in BOT_TOKENS:
             logger.error(f"Invalid bot token: {token[:10]}...")
@@ -336,6 +345,7 @@ def index():
 
 @app.route("/api/scrape", methods=["POST"])
 async def scrape():
+    loop = asyncio.get_event_loop()
     global scrape_progress
     data = request.get_json(silent=True)
     if not data:
@@ -359,6 +369,7 @@ async def scrape():
 
 @app.route("/api/add", methods=["POST"])
 async def add():
+    loop = asyncio.get_event_loop()
     global add_progress
     data = request.get_json(silent=True)
     if not data:
@@ -416,6 +427,7 @@ def check_members():
         return jsonify({"message": f"Error: {str(e)}"}), 500
 
 async def setup_webhooks():
+    loop = asyncio.get_event_loop()
     for i, bot in enumerate(bots):
         try:
             await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
