@@ -332,6 +332,19 @@ def get_debug_csv():
         logger.error(f"Error reading debug.csv: {str(e)}")
         return jsonify({"message": "Debug CSV not found"}), 404
 
+@app.route("/api/check-members")
+def check_members():
+    try:
+        if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+            return jsonify({"message": "Failed to download members.csv"}), 500
+        with open("members.csv", "r") as f:
+            content = f.read()
+        df = pd.read_csv("members.csv")
+        return jsonify({"message": "Members found", "rows": len(df), "content_preview": content[:100]})
+    except Exception as e:
+        logger.error(f"Error checking members.csv: {str(e)}")
+        return jsonify({"message": f"Error: {str(e)}"}), 500
+
 async def setup_webhooks():
     for i, bot in enumerate(bots):
         try:
