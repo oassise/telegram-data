@@ -10,6 +10,7 @@ from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
 from telegram import Bot, Update
 from telegram.ext import Application
+from telegram.error import BadRequest, Forbidden
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -226,8 +227,19 @@ async def add_members(target_group, progress_callback):
             return 0, "No members found in GitHub. Please scrape members first."
         added_count = 0
         total = len(df)
-        # Process target_group 
+        # Process target_group URL
         chat_id = target_group.replace("https://t.me/", "@")
+        logger.info(f"Validating chat_id {chat_id}")
+        # Verify chat_id
+        for i, bot in enumerate(bots):
+            try:
+                chat = await bot.get_chat(chat_id)
+                chat_id = chat.id  # Use numeric chat ID for reliability
+                logger.info(f"Resolved chat_id to {chat_id}")
+                break
+            except Exception as e:
+                logger.error(f"Error validating chat_id {chat_id} with bot {i+1}: {str(e)}")
+                return 0, f"Invalid target group {chat_id}: {str(e)}"
         logger.info(f"Adding {total} members to {chat_id}")
         for i, bot in enumerate(bots):
             token = BOT_TOKENS[i]
@@ -242,23 +254,33 @@ async def add_members(target_group, progress_callback):
                     logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
                     break
                 try:
-                    await bot.invite_chat_members(chat_id=chat_id, user_ids=[row["user_id"]])
+                    await bot.invite_chat_members(chat_id=chat_id, user_ids=[int(row["user_id"])])
                     added_count += 1
                     bot_limit += 1
                     daily_limits[token]["count"] = bot_limit
                     progress_callback((added_count) / total * 100)
                     logger.info(f"Added user {row['user_id']} to {chat_id}")
-                    await asyncio.sleep(1)  # Avoid Telegram rate limits
-                except Exception as e:
-                    logger.error(f"Error adding user {row['user_id']} to {chat_id}: {str(e)}")
-                    if "bot is not a member" in str(e).lower() or "chat_admin_required" in str(e).lower():
-                        return 0, f"Bot {i+1} is not an admin or member of {chat_id}"
-                    if "too many requests" in str(e).lower():
-                        logger.warning(f"Rate limit hit for bot {i+1}, waiting 10 seconds...")
-                        await asyncio.sleep(10)
+                    await asyncio.sleep(2)  # Increased to avoid rate limits
+                except BadRequest as e:
+                    logger.error(f"BadRequest adding user {row['user_id']} to {chat_id}: {str(e)}")
+                    if "chat_admin_required" in str(e).lower():
+                        return 0, f"Bot {i+1} is not an admin of {chat_id}"
                     if "user_id_invalid" in str(e).lower():
                         logger.warning(f"Invalid user ID {row['user_id']} for {chat_id}, skipping...")
                         continue
+                    if "user_privacy_restricted" in str(e).lower():
+                        logger.warning(f"User {row['user_id']} has restricted group invites, skipping...")
+                        continue
+                except Forbidden as e:
+                    logger.error(f"Forbidden error adding user {row['user_id']} to {chat_id}: {str(e)}")
+                    if "bot is not a member" in str(e).lower():
+                        return 0, f"Bot {i+1} is not a member of {chat_id}"
+                except Exception as e:
+                    logger.error(f"Error adding user {row['user_id']} to {chat_id}: {str(e)}")
+                    if "too many requests" in str(e).lower():
+                        logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
+                        await asyncio.sleep(15)
+                    continue
         return added_count, f"Added {added_count} members to {chat_id}"
     except Exception as e:
         logger.error(f"Error in add_members: {str(e)}")
