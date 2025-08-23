@@ -42,7 +42,7 @@ DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://my-app.web.app"}})
+CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
 bots = []
 applications = []
 for token in BOT_TOKENS:
