@@ -21,6 +21,10 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Log library version
+import telegram
+logger.info(f"python-telegram-bot version: {telegram.__version__}")
+
 # Load environment variables
 load_dotenv()
 
@@ -38,7 +42,7 @@ DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
+CORS(app, resources={r"/api/*": {"origins": "https://my-app.web.app"}})
 bots = []
 applications = []
 for token in BOT_TOKENS:
@@ -210,6 +214,26 @@ async def scrape_members(source_group, progress_callback):
             logger.error(f"Error in scrape_members: {str(e)}")
             raise e
 
+# Add members using raw Telegram API
+async def invite_user_to_chat(token, chat_id, user_id):
+    url = f"https://api.telegram.org/bot{token}/inviteChatMember"
+    payload = {
+        "chat_id": chat_id,
+        "user_id": user_id
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        result = response.json()
+        if response.status_code == 200 and result.get("ok"):
+            logger.info(f"Successfully invited user {user_id} to {chat_id}")
+            return True
+        else:
+            logger.error(f"Failed to invite user {user_id} to {chat_id}: {result.get('description', 'Unknown error')}")
+            return False
+    except Exception as e:
+        logger.error(f"Error inviting user {user_id} to {chat_id}: {str(e)}")
+        return False
+
 # Add members
 async def add_members(target_group, progress_callback):
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
@@ -243,8 +267,7 @@ async def add_members(target_group, progress_callback):
                 logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}. Proceeding with {chat_id}")
                 break  # Use provided chat_id as fallback
         logger.info(f"Adding {total} members to {validated_chat_id}")
-        for i, bot in enumerate(bots):
-            token = BOT_TOKENS[i]
+        for i, token in enumerate(BOT_TOKENS):
             if daily_limits[token]["reset_date"] < datetime.now():
                 daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
             bot_limit = daily_limits[token]["count"]
@@ -259,29 +282,28 @@ async def add_members(target_group, progress_callback):
                 retries = 3
                 for attempt in range(1, retries + 1):
                     try:
-                        await bot.invite_chat_member(chat_id=validated_chat_id, user_id=user_id)
-                        added_count += 1
-                        bot_limit += 1
-                        daily_limits[token]["count"] = bot_limit
-                        progress_callback((added_count) / total * 100)
-                        logger.info(f"Added user {user_id} to {validated_chat_id}")
-                        break
-                    except BadRequest as e:
-                        logger.error(f"BadRequest adding user {user_id} to {validated_chat_id}: {str(e)}")
-                        if "chat_admin_required" in str(e).lower():
+                        success = await invite_user_to_chat(token, validated_chat_id, user_id)
+                        if success:
+                            added_count += 1
+                            bot_limit += 1
+                            daily_limits[token]["count"] = bot_limit
+                            progress_callback((added_count) / total * 100)
+                            logger.info(f"Added user {user_id} to {validated_chat_id}")
+                            break
+                        else:
+                            logger.warning(f"Failed to add user {user_id} on attempt {attempt}, retrying...")
+                    except Exception as e:
+                        logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
+                        if "chat_admin_required" in str(e).lower() or "not an admin" in str(e).lower():
                             return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
-                        if "user_id_invalid" in str(e).lower():
+                        if "invalid user_id" in str(e).lower():
                             logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
                             break
                         if "user_privacy_restricted" in str(e).lower():
                             logger.warning(f"User {user_id} has restricted group invites, skipping...")
                             break
-                    except Forbidden as e:
-                        logger.error(f"Forbidden error adding user {user_id} to {validated_chat_id}: {str(e)}")
-                        if "bot is not a member" in str(e).lower():
+                        if "not a member" in str(e).lower():
                             return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
-                    except Exception as e:
-                        logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
                         if "too many requests" in str(e).lower():
                             logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
                             await asyncio.sleep(15)
