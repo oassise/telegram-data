@@ -259,7 +259,7 @@ async def add_members(target_group, progress_callback):
                 retries = 3
                 for attempt in range(1, retries + 1):
                     try:
-                        await bot.invite_chat_members(chat_id=validated_chat_id, user_ids=[user_id])
+                        await bot.invite_chat_member(chat_id=validated_chat_id, user_id=user_id)
                         added_count += 1
                         bot_limit += 1
                         daily_limits[token]["count"] = bot_limit
