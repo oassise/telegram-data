@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
 import logging
+import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -58,13 +59,15 @@ daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in B
 
 # Initialize applications
 async def initialize_applications():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     for application in applications:
         try:
             await application.initialize()
             logger.info("Application initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize application: {str(e)}")
+    return loop
 
 # GitHub API functions
 def upload_to_github(content, file_path):
@@ -216,12 +219,14 @@ async def scrape_members(source_group, progress_callback):
 
 # Add members using raw Telegram API
 async def invite_user_to_chat(token, chat_id, user_id):
-    url = f"https://api.telegram.org/bot{token}/inviteChatMember"
-    payload = {
-        "chat_id": chat_id,
-        "user_id": user_id
-    }
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
+        url = f"https://api.telegram.org/bot{token}/inviteChatMember"
+        payload = {
+            "chat_id": chat_id,
+            "user_id": user_id
+        }
         response = requests.post(url, json=payload, timeout=10)
         result = response.json()
         if response.status_code == 200 and result.get("ok"):
@@ -233,6 +238,8 @@ async def invite_user_to_chat(token, chat_id, user_id):
     except Exception as e:
         logger.error(f"Error inviting user {user_id} to {chat_id}: {str(e)}")
         return False
+    finally:
+        loop.close()
 
 # Add members
 async def add_members(target_group, progress_callback):
@@ -255,17 +262,22 @@ async def add_members(target_group, progress_callback):
         # Process target_group URL
         chat_id = target_group.replace("https://t.me/", "@")
         logger.info(f"Using chat_id {chat_id}")
-        # Fallback to chat_id without validation if get_chat fails
+        # Try to resolve chat_id to numeric ID
         validated_chat_id = chat_id
-        for i, bot in enumerate(bots):
-            try:
-                chat = await bot.get_chat(chat_id)
-                validated_chat_id = chat.id  # Use numeric chat ID
-                logger.info(f"Resolved chat_id to {validated_chat_id}")
-                break
-            except Exception as e:
-                logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}. Proceeding with {chat_id}")
-                break  # Use provided chat_id as fallback
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            for i, bot in enumerate(bots):
+                try:
+                    chat = await bot.get_chat(chat_id)
+                    validated_chat_id = chat.id  # Use numeric chat ID
+                    logger.info(f"Resolved chat_id to {validated_chat_id}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}. Proceeding with {chat_id}")
+                    break  # Use provided chat_id as fallback
+        finally:
+            loop.close()
         logger.info(f"Adding {total} members to {validated_chat_id}")
         for i, token in enumerate(BOT_TOKENS):
             if daily_limits[token]["reset_date"] < datetime.now():
@@ -291,19 +303,28 @@ async def add_members(target_group, progress_callback):
                             logger.info(f"Added user {user_id} to {validated_chat_id}")
                             break
                         else:
-                            logger.warning(f"Failed to add user {user_id} on attempt {attempt}, retrying...")
+                            result = requests.post(
+                                f"https://api.telegram.org/bot{token}/inviteChatMember",
+                                json={"chat_id": validated_chat_id, "user_id": user_id},
+                                timeout=10
+                            ).json()
+                            error_desc = result.get("description", "Unknown error")
+                            if "chat_admin_required" in error_desc.lower():
+                                return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
+                            if "invalid user_id" in error_desc.lower():
+                                logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
+                                break
+                            if "user_privacy_restricted" in error_desc.lower():
+                                logger.warning(f"User {user_id} has restricted group invites, skipping...")
+                                break
+                            if "not a member" in error_desc.lower():
+                                return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
+                            if "not found" in error_desc.lower():
+                                logger.warning(f"Chat {validated_chat_id} not found, skipping user {user_id}...")
+                                break
+                            logger.warning(f"Failed to add user {user_id} on attempt {attempt}: {error_desc}, retrying...")
                     except Exception as e:
                         logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
-                        if "chat_admin_required" in str(e).lower() or "not an admin" in str(e).lower():
-                            return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
-                        if "invalid user_id" in str(e).lower():
-                            logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
-                            break
-                        if "user_privacy_restricted" in str(e).lower():
-                            logger.warning(f"User {user_id} has restricted group invites, skipping...")
-                            break
-                        if "not a member" in str(e).lower():
-                            return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
                         if "too many requests" in str(e).lower():
                             logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
                             await asyncio.sleep(15)
@@ -319,7 +340,8 @@ async def add_members(target_group, progress_callback):
 # Webhook handler
 @app.route("/telegram/<token>", methods=["POST"])
 async def telegram_webhook(token):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         if token not in BOT_TOKENS:
             logger.error(f"Invalid bot token: {token[:10]}...")
@@ -336,6 +358,8 @@ async def telegram_webhook(token):
     except Exception as e:
         logger.error(f"Webhook error for token {token[:10]}...: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        loop.close()
 
 # Health check
 @app.route("/healthcheck", methods=["GET"])
@@ -367,7 +391,8 @@ def index():
 
 @app.route("/api/scrape", methods=["POST"])
 async def scrape():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     global scrape_progress
     data = request.get_json(silent=True)
     if not data:
@@ -388,10 +413,13 @@ async def scrape():
     except Exception as e:
         logger.error(f"Scrape error: {str(e)}")
         return jsonify({"message": f"Error scraping members: {str(e)}"}), 500
+    finally:
+        loop.close()
 
 @app.route("/api/add", methods=["POST"])
 async def add():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     global add_progress
     data = request.get_json(silent=True)
     if not data:
@@ -412,6 +440,8 @@ async def add():
     except Exception as e:
         logger.error(f"Add error: {str(e)}")
         return jsonify({"message": f"Error adding members: {str(e)}"}), 500
+    finally:
+        loop.close()
 
 @app.route("/api/members")
 def get_members():
@@ -449,15 +479,18 @@ def check_members():
         return jsonify({"message": f"Error: {str(e)}"}), 500
 
 async def setup_webhooks():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     for i, bot in enumerate(bots):
         try:
             await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
             logger.info(f"Webhook set for bot {i+1}")
         except Exception as e:
             logger.error(f"Failed to set webhook for bot {i+1}: {str(e)}")
+    loop.close()
 
 if __name__ == "__main__":
-    asyncio.run(initialize_applications())
+    loop = asyncio.run(initialize_applications())
     asyncio.run(setup_webhooks())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    loop.close()
