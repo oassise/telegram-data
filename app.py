@@ -15,7 +15,6 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
 import logging
-import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +29,7 @@ API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
 BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2) if os.getenv(f"BOT_TOKEN_{i+1}")]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "oassise/telegram-data")
 GITHUB_FILE_PATH = "members.csv"
 GITHUB_SESSION_PATH = "session.session"
 SESSION_NAME = "session"
@@ -38,7 +37,7 @@ DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
+CORS(app, resources={r"/api/*": {"origins": "https://my-app.web.app"}})
 bots = []
 applications = []
 for token in BOT_TOKENS:
@@ -88,31 +87,67 @@ def upload_to_github(content, file_path):
         logger.error(f"Error in upload_to_github: {str(e)}")
         raise e
 
-def download_from_github(file_path, local_path, retries=3, delay=5):
+def download_from_github(file_path, local_path, retries=5, delay=10):
     for attempt in range(1, retries + 1):
         try:
+            # Log filesystem status
+            logger.info(f"Current working directory: {os.getcwd()}")
+            logger.info(f"Write permission for {local_path}: {os.access(os.getcwd(), os.W_OK)}")
+            
+            # Try GitHub API first
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
             headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-            logger.info(f"Attempt {attempt}: Downloading {file_path} from GitHub")
-            response = requests.get(url, headers=headers)
+            logger.info(f"Attempt {attempt}: Downloading {file_path} from GitHub API to {local_path}")
+            response = requests.get(url, headers=headers, timeout=15)
+            logger.info(f"GitHub API response status: {response.status_code}, headers: {response.headers}")
+            
             if response.status_code == 200:
                 content = base64.b64decode(response.json()["content"])
+                if not content:
+                    logger.error("Downloaded content is empty")
+                    return False
                 with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
                     f.write(content)
                 logger.info(f"Downloaded {file_path} to {local_path}, size: {len(content)} bytes")
+                # Verify file exists and is readable
+                if not os.path.exists(local_path):
+                    logger.error(f"File {local_path} not found after writing")
+                    return False
+                with open(local_path, "r" if not file_path.endswith(".session") else "rb") as f:
+                    preview = f.read(100)
+                    logger.info(f"File {local_path} preview: {preview}")
                 return True
+            elif response.status_code == 403 and "rate limit" in response.text.lower():
+                logger.warning(f"GitHub rate limit exceeded, retrying after {delay} seconds...")
+                time.sleep(delay)
             else:
-                logger.error(f"GitHub download failed: {response.status_code}, {response.json()}")
-                if response.status_code == 403 and "rate limit" in response.text.lower():
-                    logger.warning(f"GitHub rate limit exceeded, retrying after {delay} seconds...")
-                    time.sleep(delay)
+                logger.error(f"GitHub API download failed: {response.status_code}, {response.json()}")
+                # Fallback to raw URL
+                logger.info(f"Attempt {attempt}: Trying raw URL for {file_path}")
+                raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{file_path}"
+                raw_response = requests.get(raw_url, timeout=15)
+                logger.info(f"Raw URL response status: {raw_response.status_code}, headers: {raw_response.headers}")
+                if raw_response.status_code == 200:
+                    content = raw_response.content
+                    with open(local_path, "wb" if file_path.endswith(".session") else "w") as f:
+                        f.write(content)
+                    logger.info(f"Downloaded {file_path} to {local_path} via raw URL, size: {len(content)} bytes")
+                    if not os.path.exists(local_path):
+                        logger.error(f"File {local_path} not found after writing via raw URL")
+                        return False
+                    with open(local_path, "r" if not file_path.endswith(".session") else "rb") as f:
+                        preview = f.read(100)
+                        logger.info(f"File {local_path} preview: {preview}")
+                    return True
                 else:
+                    logger.error(f"Raw URL download failed: {raw_response.status_code}, {raw_response.text[:100]}")
                     return False
         except Exception as e:
             logger.error(f"Error in download_from_github (attempt {attempt}): {str(e)}")
             if attempt == retries:
                 return False
             time.sleep(delay)
+    logger.error(f"Failed to download {file_path} after {retries} attempts")
     return False
 
 # Download session file before starting client
@@ -185,7 +220,8 @@ async def add_members(target_group, progress_callback):
             logger.error("members.csv not found locally after download attempt")
             return 0, "No members found in GitHub. Please scrape members first."
         with open("members.csv", "r") as f:
-            logger.info(f"members.csv content preview: {f.read(100)}...")
+            preview = f.read(100)
+            logger.info(f"members.csv content preview: {preview}...")
         df = pd.read_csv("members.csv")
         if df.empty:
             logger.error("members.csv is empty")
@@ -336,6 +372,7 @@ def get_debug_csv():
 def check_members():
     try:
         if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
+            logger.error("check-members: Failed to download members.csv")
             return jsonify({"message": "Failed to download members.csv"}), 500
         with open("members.csv", "r") as f:
             content = f.read()
