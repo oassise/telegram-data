@@ -6,25 +6,17 @@ import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from telethon.sync import TelegramClient
-from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.functions.channels import GetParticipantsRequest, InviteToChannelRequest
 from telethon.tl.types import ChannelParticipantsSearch
-from telegram import Bot, Update
-from telegram.ext import Application
-from telegram.error import BadRequest, Forbidden
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import asyncio
 import logging
-import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Log library version
-import telegram
-logger.info(f"python-telegram-bot version: {telegram.__version__}")
 
 # Load environment variables
 load_dotenv()
@@ -33,41 +25,17 @@ load_dotenv()
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 PHONE = os.getenv("PHONE")
-BOT_TOKENS = [os.getenv(f"BOT_TOKEN_{i+1}") for i in range(2) if os.getenv(f"BOT_TOKEN_{i+1}")]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "oassise/telegram-data")
 GITHUB_FILE_PATH = "members.csv"
 GITHUB_SESSION_PATH = "session.session"
 SESSION_NAME = "session"
-DAILY_LIMIT_PER_BOT = 50
+DAILY_LIMIT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
-bots = []
-applications = []
-for token in BOT_TOKENS:
-    try:
-        bot = Bot(token=token)
-        application = Application.builder().token(token).build()
-        bots.append(bot)
-        applications.append(application)
-        logger.info(f"Initialized bot with token {token[:10]}...")
-    except Exception as e:
-        logger.error(f"Failed to initialize bot with token {token[:10]}...: {str(e)}")
-daily_limits = {token: {"count": 0, "reset_date": datetime.now()} for token in BOT_TOKENS}
-
-# Initialize applications
-async def initialize_applications():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    for application in applications:
-        try:
-            await application.initialize()
-            logger.info("Application initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize application: {str(e)}")
-    return loop
+daily_limit = {"count": 0, "reset_date": datetime.now()}
 
 # GitHub API functions
 def upload_to_github(content, file_path):
@@ -99,52 +67,27 @@ def upload_to_github(content, file_path):
 def download_from_github(file_path, local_path, retries=5, delay=10):
     for attempt in range(1, retries + 1):
         try:
-            logger.info(f"Current working directory: {os.getcwd()}")
-            logger.info(f"Write permission for {local_path}: {os.access(os.getcwd(), os.W_OK)}")
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
             headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
             logger.info(f"Attempt {attempt}: Downloading {file_path} from GitHub API to {local_path}")
             response = requests.get(url, headers=headers, timeout=15)
-            logger.info(f"GitHub API response status: {response.status_code}, headers: {response.headers}")
             if response.status_code == 200:
                 content = base64.b64decode(response.json()["content"])
-                if not content:
-                    logger.error("Downloaded content is empty")
-                    return False
                 write_content = content.decode("utf-8") if not file_path.endswith(".session") else content
-                logger.info(f"Content type: {'text' if not file_path.endswith('.session') else 'binary'}, length: {len(content)} bytes")
                 with open(local_path, "w" if not file_path.endswith(".session") else "wb") as f:
                     f.write(write_content)
                 logger.info(f"Downloaded {file_path} to {local_path}, size: {len(content)} bytes")
-                if not os.path.exists(local_path):
-                    logger.error(f"File {local_path} not found after writing")
-                    return False
-                with open(local_path, "r" if not file_path.endswith(".session") else "rb") as f:
-                    preview = f.read(100)
-                    logger.info(f"File {local_path} preview: {preview}")
                 return True
-            elif response.status_code == 403 and "rate limit" in response.text.lower():
-                logger.warning(f"GitHub rate limit exceeded, retrying after {delay} seconds...")
-                time.sleep(delay)
             else:
                 logger.error(f"GitHub API download failed: {response.status_code}, {response.json()}")
-                logger.info(f"Attempt {attempt}: Trying raw URL for {file_path}")
                 raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{file_path}"
                 raw_response = requests.get(raw_url, timeout=15)
-                logger.info(f"Raw URL response status: {raw_response.status_code}, headers: {raw_response.headers}")
                 if raw_response.status_code == 200:
                     content = raw_response.content
                     write_content = content.decode("utf-8") if not file_path.endswith(".session") else content
-                    logger.info(f"Raw content type: {'text' if not file_path.endswith('.session') else 'binary'}, length: {len(content)} bytes")
                     with open(local_path, "w" if not file_path.endswith(".session") else "wb") as f:
                         f.write(write_content)
                     logger.info(f"Downloaded {file_path} to {local_path} via raw URL, size: {len(content)} bytes")
-                    if not os.path.exists(local_path):
-                        logger.error(f"File {local_path} not found after writing via raw URL")
-                        return False
-                    with open(local_path, "r" if not file_path.endswith(".session") else "rb") as f:
-                        preview = f.read(100)
-                        logger.info(f"File {local_path} preview: {preview}")
                     return True
                 else:
                     logger.error(f"Raw URL download failed: {raw_response.status_code}, {raw_response.text[:100]}")
@@ -157,7 +100,7 @@ def download_from_github(file_path, local_path, retries=5, delay=10):
     logger.error(f"Failed to download {file_path} after {retries} attempts")
     return False
 
-# Download session file before starting client
+# Download session file
 def ensure_session():
     if not os.path.exists(f"{SESSION_NAME}.session"):
         return download_from_github(GITHUB_SESSION_PATH, f"{SESSION_NAME}.session")
@@ -196,19 +139,13 @@ async def scrape_members(source_group, progress_callback):
                 })
                 progress_callback((i + 1) / total * 100)
                 await asyncio.sleep(0.5)
-            # Generate CSV content
             csv_content = "user_id,username,first_name,last_name\n"
             for m in members:
                 csv_content += f"{m['user_id']},{m['username']},{m['first_name']},{m['last_name']}\n"
-            logger.info(f"CSV content length: {len(csv_content)}")
-            # Save debug CSV locally for verification
             with open("debug.csv", "w") as f:
                 f.write(csv_content)
-            logger.info("Saved debug.csv locally")
-            # Upload to GitHub
             if not upload_to_github(csv_content.encode("utf-8"), GITHUB_FILE_PATH):
                 raise Exception("Failed to upload members.csv to GitHub")
-            # Save and upload session file
             if os.path.exists(f"{SESSION_NAME}.session"):
                 with open(f"{SESSION_NAME}.session", "rb") as f:
                     upload_to_github(f.read(), GITHUB_SESSION_PATH)
@@ -217,33 +154,7 @@ async def scrape_members(source_group, progress_callback):
             logger.error(f"Error in scrape_members: {str(e)}")
             raise e
 
-# Add members using raw Telegram API
-async def invite_user_to_chat(token, chat_id, user_id):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        url = f"https://api.telegram.org/bot{token}/inviteChatMember"
-        payload = {
-            "chat_id": chat_id,
-            "user_id": user_id
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        result = response.json()
-        logger.info(f"Invite response for user {user_id} to {chat_id}: {result}")
-        if response.status_code == 200 and result.get("ok"):
-            logger.info(f"Successfully invited user {user_id} to {chat_id}")
-            return True
-        else:
-            error_desc = result.get("description", "Unknown error")
-            logger.error(f"Failed to invite user {user_id} to {chat_id}: {error_desc}")
-            return error_desc
-    except Exception as e:
-        logger.error(f"Error inviting user {user_id} to {chat_id}: {str(e)}")
-        return str(e)
-    finally:
-        loop.close()
-
-# Add members
+# Add members using Telethon
 async def add_members(target_group, progress_callback):
     if not download_from_github(GITHUB_FILE_PATH, "members.csv"):
         logger.error("Failed to download members.csv from GitHub")
@@ -261,118 +172,61 @@ async def add_members(target_group, progress_callback):
             return 0, "No members found in GitHub. Please scrape members first."
         added_count = 0
         total = len(df)
-        # Process target_group URL
         chat_id = target_group.replace("https://t.me/", "@")
-        logger.info(f"Using chat_id {chat_id}")
-        # Try to resolve chat_id to numeric ID
-        validated_chat_id = None
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            for i, bot in enumerate(bots):
-                try:
-                    chat = await bot.get_chat(chat_id)
-                    validated_chat_id = chat.id  # Use numeric chat ID
-                    logger.info(f"Resolved chat_id {chat_id} to {validated_chat_id}")
-                    break
-                except Exception as e:
-                    logger.warning(f"Failed to validate chat_id {chat_id} with bot {i+1}: {str(e)}")
-                    # Try numeric ID from invite link
-                    invite_response = requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKENS[i]}/createChatInviteLink",
-                        json={"chat_id": chat_id},
-                        timeout=10
-                    ).json()
-                    if invite_response.get("ok"):
-                        invite_link = invite_response["result"]["invite_link"]
-                        logger.info(f"Created invite link for {chat_id}: {invite_link}")
-                        # Extract numeric ID (not directly possible from link, fallback to chat_id)
-                        validated_chat_id = chat_id
-                    else:
-                        logger.error(f"Failed to create invite link for {chat_id}: {invite_response.get('description')}")
-                        validated_chat_id = chat_id
-                    break
-        finally:
-            loop.close()
-        if not validated_chat_id:
-            return 0, f"Failed to resolve chat_id for {chat_id}"
-        logger.info(f"Adding {total} members to {validated_chat_id}")
-        for i, token in enumerate(BOT_TOKENS):
-            if daily_limits[token]["reset_date"] < datetime.now():
-                daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
-            bot_limit = daily_limits[token]["count"]
-            if bot_limit >= DAILY_LIMIT_PER_BOT:
-                logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
-                continue
-            for j, row in df.iterrows():
-                if bot_limit >= DAILY_LIMIT_PER_BOT:
-                    logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
-                    break
-                user_id = int(row["user_id"])
-                retries = 3
-                for attempt in range(1, retries + 1):
+        logger.info(f"Adding {total} members to {chat_id}")
+        async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
+            try:
+                await client.start(phone=lambda: PHONE, password=lambda: os.getenv("TELEGRAM_PASSWORD"))
+                group = await client.get_entity(chat_id)
+                existing_members = set()
+                participants = await client(GetParticipantsRequest(
+                    channel=group, filter=ChannelParticipantsSearch(""), offset=0, limit=1000, hash=0
+                ))
+                for user in participants.users:
+                    existing_members.add(user.id)
+                if daily_limit["reset_date"] < datetime.now():
+                    daily_limit["count"] = 0
+                    daily_limit["reset_date"] = datetime.now() + timedelta(days=1)
+                if daily_limit["count"] >= DAILY_LIMIT:
+                    logger.warning(f"Reached daily limit of {DAILY_LIMIT}")
+                    return 0, f"Reached daily limit of {DAILY_LIMIT}"
+                for i, row in df.iterrows():
+                    user_id = int(row["user_id"])
+                    if user_id in existing_members:
+                        logger.info(f"User {user_id} already in {chat_id}, skipping...")
+                        continue
+                    if daily_limit["count"] >= DAILY_LIMIT:
+                        logger.warning(f"Reached daily limit of {DAILY_LIMIT}")
+                        break
                     try:
-                        result = await invite_user_to_chat(token, validated_chat_id, user_id)
-                        if result is True:
-                            added_count += 1
-                            bot_limit += 1
-                            daily_limits[token]["count"] = bot_limit
-                            progress_callback((added_count) / total * 100)
-                            logger.info(f"Added user {user_id} to {validated_chat_id}")
-                            break
-                        else:
-                            error_desc = result
-                            if "chat_admin_required" in error_desc.lower():
-                                return 0, f"Bot {i+1} is not an admin of {validated_chat_id}"
-                            if "invalid user_id" in error_desc.lower():
-                                logger.warning(f"Invalid user ID {user_id} for {validated_chat_id}, skipping...")
-                                break
-                            if "user_privacy_restricted" in error_desc.lower():
-                                logger.warning(f"User {user_id} has restricted group invites, skipping...")
-                                break
-                            if "not a member" in error_desc.lower():
-                                return 0, f"Bot {i+1} is not a member of {validated_chat_id}"
-                            if "not found" in error_desc.lower():
-                                logger.warning(f"Chat {validated_chat_id} not found, skipping user {user_id}...")
-                                return 0, f"Chat {validated_chat_id} not found"
-                            logger.warning(f"Failed to add user {user_id} on attempt {attempt}: {error_desc}, retrying...")
+                        await client(InviteToChannelRequest(channel=group, users=[user_id]))
+                        added_count += 1
+                        daily_limit["count"] += 1
+                        progress_callback((added_count) / total * 100)
+                        logger.info(f"Added user {user_id} to {chat_id}")
+                        await asyncio.sleep(60)  # Avoid flood limits
                     except Exception as e:
-                        logger.error(f"Error adding user {user_id} to {validated_chat_id} (attempt {attempt}): {str(e)}")
-                        if "too many requests" in str(e).lower():
-                            logger.warning(f"Rate limit hit for bot {i+1}, waiting 15 seconds...")
-                            await asyncio.sleep(15)
+                        logger.error(f"Error adding user {user_id} to {chat_id}: {str(e)}")
+                        if "flood" in str(e).lower():
+                            logger.warning(f"Flood limit hit, waiting 900 seconds...")
+                            await asyncio.sleep(900)
                             continue
-                        if attempt == retries:
-                            logger.warning(f"Failed to add user {user_id} after {retries} attempts, skipping...")
-                    await asyncio.sleep(2)  # Avoid rate limits
-        return added_count, f"Added {added_count} members to {validated_chat_id}"
+                        if "user already participant" in str(e).lower():
+                            logger.info(f"User {user_id} already in {chat_id}, skipping...")
+                            continue
+                        if "user_id_invalid" in str(e).lower():
+                            logger.warning(f"Invalid user ID {user_id}, skipping...")
+                            continue
+                        if "chat_admin_required" in str(e).lower():
+                            return 0, f"Client is not an admin of {chat_id}"
+                        logger.warning(f"Failed to add user {user_id}, skipping...")
+                return added_count, f"Added {added_count} members to {chat_id}"
+            except Exception as e:
+                logger.error(f"Error in add_members: {str(e)}")
+                return 0, f"Error adding members: {str(e)}"
     except Exception as e:
         logger.error(f"Error in add_members: {str(e)}")
         return 0, f"Error adding members: {str(e)}"
-
-# Webhook handler
-@app.route("/telegram/<token>", methods=["POST"])
-async def telegram_webhook(token):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        if token not in BOT_TOKENS:
-            logger.error(f"Invalid bot token: {token[:10]}...")
-            return jsonify({"status": "error", "message": "Invalid bot token"}), 401
-        data = request.get_json(silent=True)
-        if not data:
-            logger.error("Invalid JSON payload in webhook")
-            return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
-        application = applications[BOT_TOKENS.index(token)]
-        update = Update.de_json(data, bots[BOT_TOKENS.index(token)])
-        if update:
-            await application.process_update(update)
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        logger.error(f"Webhook error for token {token[:10]}...: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        loop.close()
 
 # Health check
 @app.route("/healthcheck", methods=["GET"])
@@ -404,8 +258,6 @@ def index():
 
 @app.route("/api/scrape", methods=["POST"])
 async def scrape():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     global scrape_progress
     data = request.get_json(silent=True)
     if not data:
@@ -426,13 +278,9 @@ async def scrape():
     except Exception as e:
         logger.error(f"Scrape error: {str(e)}")
         return jsonify({"message": f"Error scraping members: {str(e)}"}), 500
-    finally:
-        loop.close()
 
 @app.route("/api/add", methods=["POST"])
 async def add():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     global add_progress
     data = request.get_json(silent=True)
     if not data:
@@ -453,8 +301,6 @@ async def add():
     except Exception as e:
         logger.error(f"Add error: {str(e)}")
         return jsonify({"message": f"Error adding members: {str(e)}"}), 500
-    finally:
-        loop.close()
 
 @app.route("/api/members")
 def get_members():
@@ -467,15 +313,6 @@ def get_members():
     except Exception as e:
         logger.error(f"Error reading members.csv: {str(e)}")
         return jsonify([])
-
-@app.route("/api/debug-csv")
-def get_debug_csv():
-    try:
-        with open("debug.csv", "r") as f:
-            return Response(f.read(), mimetype="text/csv")
-    except Exception as e:
-        logger.error(f"Error reading debug.csv: {str(e)}")
-        return jsonify({"message": "Debug CSV not found"}), 404
 
 @app.route("/api/check-members")
 def check_members():
@@ -491,19 +328,5 @@ def check_members():
         logger.error(f"Error checking members.csv: {str(e)}")
         return jsonify({"message": f"Error: {str(e)}"}), 500
 
-async def setup_webhooks():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    for i, bot in enumerate(bots):
-        try:
-            await bot.set_webhook(url=f"{RENDER_URL}/telegram/{BOT_TOKENS[i]}")
-            logger.info(f"Webhook set for bot {i+1}")
-        except Exception as e:
-            logger.error(f"Failed to set webhook for bot {i+1}: {str(e)}")
-    loop.close()
-
 if __name__ == "__main__":
-    loop = asyncio.run(initialize_applications())
-    asyncio.run(setup_webhooks())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    loop.close()
