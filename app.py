@@ -37,7 +37,7 @@ DAILY_LIMIT_PER_BOT = 50
 RENDER_URL = "https://telegram-data.onrender.com"
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.web.app"}})
+CORS(app, resources={r"/api/*": {"origins": "https://oassisjob.app"}})
 bots = []
 applications = []
 for token in BOT_TOKENS:
@@ -90,29 +90,23 @@ def upload_to_github(content, file_path):
 def download_from_github(file_path, local_path, retries=5, delay=10):
     for attempt in range(1, retries + 1):
         try:
-            # Log filesystem status
             logger.info(f"Current working directory: {os.getcwd()}")
             logger.info(f"Write permission for {local_path}: {os.access(os.getcwd(), os.W_OK)}")
-            
-            # Try GitHub API first
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
             headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
             logger.info(f"Attempt {attempt}: Downloading {file_path} from GitHub API to {local_path}")
             response = requests.get(url, headers=headers, timeout=15)
             logger.info(f"GitHub API response status: {response.status_code}, headers: {response.headers}")
-            
             if response.status_code == 200:
                 content = base64.b64decode(response.json()["content"])
                 if not content:
                     logger.error("Downloaded content is empty")
                     return False
-                # Decode bytes to string for text files
                 write_content = content.decode("utf-8") if not file_path.endswith(".session") else content
                 logger.info(f"Content type: {'text' if not file_path.endswith('.session') else 'binary'}, length: {len(content)} bytes")
                 with open(local_path, "w" if not file_path.endswith(".session") else "wb") as f:
                     f.write(write_content)
                 logger.info(f"Downloaded {file_path} to {local_path}, size: {len(content)} bytes")
-                # Verify file exists and is readable
                 if not os.path.exists(local_path):
                     logger.error(f"File {local_path} not found after writing")
                     return False
@@ -125,7 +119,6 @@ def download_from_github(file_path, local_path, retries=5, delay=10):
                 time.sleep(delay)
             else:
                 logger.error(f"GitHub API download failed: {response.status_code}, {response.json()}")
-                # Fallback to raw URL
                 logger.info(f"Attempt {attempt}: Trying raw URL for {file_path}")
                 raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{file_path}"
                 raw_response = requests.get(raw_url, timeout=15)
@@ -233,27 +226,37 @@ async def add_members(target_group, progress_callback):
             return 0, "No members found in GitHub. Please scrape members first."
         added_count = 0
         total = len(df)
-        logger.info(f"Adding {total} members to {target_group}")
+        # Process target_group URL (e.g., https://t.me/oaasisjob -> @oaasisjob)
+        chat_id = target_group.replace("https://t.me/", "@")
+        logger.info(f"Adding {total} members to {chat_id}")
         for i, bot in enumerate(bots):
             token = BOT_TOKENS[i]
             if daily_limits[token]["reset_date"] < datetime.now():
                 daily_limits[token] = {"count": 0, "reset_date": datetime.now() + timedelta(days=1)}
             bot_limit = daily_limits[token]["count"]
             if bot_limit >= DAILY_LIMIT_PER_BOT:
+                logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
                 continue
             for j, row in df.iterrows():
                 if bot_limit >= DAILY_LIMIT_PER_BOT:
+                    logger.warning(f"Bot {i+1} has reached daily limit of {DAILY_LIMIT_PER_BOT}")
                     break
                 try:
-                    await bot.invite_to_chat(chat_id=target_group, user_id=row["user_id"])
+                    await bot.add_chat_members(chat_id=chat_id, user_ids=[row["user_id"]])
                     added_count += 1
                     bot_limit += 1
                     daily_limits[token]["count"] = bot_limit
                     progress_callback((added_count) / total * 100)
-                    await asyncio.sleep(1)
+                    logger.info(f"Added user {row['user_id']} to {chat_id}")
+                    await asyncio.sleep(1)  # Avoid Telegram rate limits
                 except Exception as e:
-                    logger.error(f"Error adding user {row['user_id']}: {str(e)}")
-        return added_count, f"Added {added_count} members"
+                    logger.error(f"Error adding user {row['user_id']} to {chat_id}: {str(e)}")
+                    if "bot is not a member" in str(e).lower() or "chat_admin_required" in str(e).lower():
+                        return 0, f"Bot {i+1} is not an admin or member of {chat_id}"
+                    if "too many requests" in str(e).lower():
+                        logger.warning(f"Rate limit hit for bot {i+1}, waiting 10 seconds...")
+                        await asyncio.sleep(10)
+        return added_count, f"Added {added_count} members to {chat_id}"
     except Exception as e:
         logger.error(f"Error in add_members: {str(e)}")
         return 0, f"Error adding members: {str(e)}"
